@@ -146,6 +146,10 @@ def format_money(amount: float) -> str:
     return f"${amount:.4f}" if amount < 1 else f"${amount:.2f}"
 
 
+def format_number(value: float) -> str:
+    return f"{value:,.0f}" if value == int(value) else f"{value:,.2f}"
+
+
 def count_content_chars(content: Any) -> int:
     if isinstance(content, str):
         return len(content)
@@ -176,11 +180,13 @@ def estimate_usage_cost(
     response_chars: int,
     input_tokens: Optional[int],
     output_tokens: Optional[int],
+    provider_cost: Optional[float] = None,
 ) -> tuple[int, int, float]:
     cost_config = curr_config.get("cost_estimation") or {}
     input_token_count = input_tokens if input_tokens is not None else estimate_tokens(prompt_chars, float(cost_config.get("input_tokens_per_char", 0.25)))
     output_token_count = output_tokens if output_tokens is not None else estimate_tokens(response_chars, float(cost_config.get("output_tokens_per_char", 0.25)))
-    return input_token_count, output_token_count, calculate_cost(curr_config, model_name, input_token_count, output_token_count)
+    estimated_cost = provider_cost if provider_cost is not None else calculate_cost(curr_config, model_name, input_token_count, output_token_count)
+    return input_token_count, output_token_count, estimated_cost
 
 
 def get_usage_log_path(curr_config: dict[str, Any]) -> str:
@@ -237,24 +243,59 @@ def summarize_top_messengers(events: list[dict[str, Any]], limit: int = 5) -> li
     return sorted(((user_id, count, cost) for user_id, (count, cost) in users.items()), key=lambda item: (-item[1], -item[2], item[0]))[:limit]
 
 
-def extract_usage_tokens(usage: Any) -> tuple[Optional[int], Optional[int]]:
+def extract_usage(usage: Any) -> tuple[Optional[int], Optional[int], Optional[float]]:
     if usage is None:
-        return None, None
+        return None, None, None
 
     input_tokens = getattr(usage, "prompt_tokens", None)
     output_tokens = getattr(usage, "completion_tokens", None)
+    cost = getattr(usage, "cost", None)
 
     if isinstance(usage, dict):
         input_tokens = usage.get("prompt_tokens")
         output_tokens = usage.get("completion_tokens")
+        cost = usage.get("cost")
 
-    return input_tokens, output_tokens
+    return input_tokens, output_tokens, cost
 
 
-def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
+async def fetch_openrouter_credits(curr_config: dict[str, Any]) -> Optional[dict[str, float]]:
+    provider = curr_model.removesuffix(":vision").split("/", 1)[0]
+    provider_config = curr_config["providers"].get(provider) or {}
+
+    if "openrouter.ai" not in provider_config.get("base_url", ""):
+        return None
+
+    api_key = provider_config.get("api_key")
+    if not api_key:
+        return None
+
+    response = await httpx_client.get(
+        "https://openrouter.ai/api/v1/credits",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=10,
+    )
+    response.raise_for_status()
+
+    data = response.json()["data"]
+    total_credits = float(data.get("total_credits", 0))
+    total_usage = float(data.get("total_usage", 0))
+
+    return dict(total_credits=total_credits, total_usage=total_usage, balance=total_credits - total_usage)
+
+
+async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
     events = load_usage_events(curr_config)
     hour_cost, day_cost, month_cost = summarize_costs(events)
     top_messengers = summarize_top_messengers(events)
+    openrouter_credits = None
+    openrouter_error = None
+
+    try:
+        openrouter_credits = await fetch_openrouter_credits(curr_config)
+    except Exception as exc:
+        logging.exception("Error while fetching OpenRouter credits")
+        openrouter_error = f"{type(exc).__name__}: {exc}"
 
     concurrency_limit = curr_config.get("global_concurrency_limit", 0)
     busy_threshold = concurrency_limit * 0.75 if concurrency_limit else float("inf")
@@ -271,37 +312,77 @@ def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
 
     uptime = format_duration((datetime.now().astimezone() - monitor_state.start_time).total_seconds())
     latency_ms = round(discord_bot.latency * 1000)
+    success_count = max(0, monitor_state.llm_requests - monitor_state.failed_llm_requests)
+    success_rate = (success_count / monitor_state.llm_requests * 100) if monitor_state.llm_requests else 100
+    total_tokens_30d = sum(int(event.get("input_tokens", 0)) + int(event.get("output_tokens", 0)) for event in events)
 
     embed = discord.Embed(
         title="Bot Monitor",
-        description=f"Status: **{health_label}**",
+        description=(
+            f"**{health_label}**\n"
+            f"`{curr_model}`\n"
+            f"Up for **{uptime}** with **{latency_ms} ms** gateway latency."
+        ),
         color=color,
         timestamp=datetime.now().astimezone(),
     )
 
-    embed.add_field(name="Model", value=f"`{curr_model}`", inline=False)
-    embed.add_field(name="Uptime", value=uptime, inline=True)
-    embed.add_field(name="Latency", value=f"{latency_ms} ms", inline=True)
-    embed.add_field(name="Active", value=str(monitor_state.active_generations), inline=True)
-    embed.add_field(name="Cache", value=f"{len(msg_nodes)} / {MAX_MESSAGE_NODES}", inline=True)
-    embed.add_field(name="Messages Seen", value=f"{monitor_state.messages_seen:,}", inline=True)
-    embed.add_field(name="LLM Requests", value=f"{monitor_state.llm_requests:,}", inline=True)
-    embed.add_field(name="Failures", value=f"{monitor_state.failed_llm_requests:,}", inline=True)
-    embed.add_field(name="Generated", value=f"{monitor_state.generated_messages:,}", inline=True)
-    embed.add_field(name="Last Request", value=format_timestamp(monitor_state.last_request_time), inline=False)
     embed.add_field(
-        name="Estimated Cost",
-        value=f"Last hour: **{format_money(hour_cost)}**\nLast day: **{format_money(day_cost)}**\nLast 30 days: **{format_money(month_cost)}**",
+        name="Live Load",
+        value=(
+            f"Active: **{monitor_state.active_generations} / {concurrency_limit or 'unlimited'}**\n"
+            f"Cache: **{len(msg_nodes)} / {MAX_MESSAGE_NODES}**\n"
+            f"Last request: **{format_timestamp(monitor_state.last_request_time)}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Traffic",
+        value=(
+            f"Messages seen: **{monitor_state.messages_seen:,}**\n"
+            f"LLM requests: **{monitor_state.llm_requests:,}**\n"
+            f"Generated replies: **{monitor_state.generated_messages:,}**"
+        ),
         inline=True,
     )
+    embed.add_field(
+        name="Reliability",
+        value=(
+            f"Success rate: **{success_rate:.1f}%**\n"
+            f"Failures: **{monitor_state.failed_llm_requests:,}**\n"
+            f"30d tokens: **{total_tokens_30d:,}**"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Local Spend Estimate",
+        value=f"Last hour: **{format_money(hour_cost)}**\nLast day: **{format_money(day_cost)}**\nLast 30 days: **{format_money(month_cost)}**",
+        inline=False,
+    )
 
-    leaderboard = "\n".join(f"{index}. <@{user_id}> - {count} requests, {format_money(cost)}" for index, (user_id, count, cost) in enumerate(top_messengers, start=1))
+    if openrouter_credits:
+        embed.add_field(
+            name="OpenRouter Account",
+            value=(
+                f"Balance: **{format_money(openrouter_credits['balance'])}**\n"
+                f"Total credits: **{format_money(openrouter_credits['total_credits'])}**\n"
+                f"Total usage: **{format_money(openrouter_credits['total_usage'])}**"
+            ),
+            inline=True,
+        )
+    elif openrouter_error:
+        embed.add_field(name="OpenRouter Account", value=f"Unavailable: `{openrouter_error[:180]}`", inline=True)
+
+    leaderboard = "\n".join(
+        f"**{index}.** <@{user_id}> - **{count}** req, **{format_money(cost)}**"
+        for index, (user_id, count, cost) in enumerate(top_messengers, start=1)
+    )
     embed.add_field(name="Top Messengers, 30d", value=leaderboard or "No usage yet", inline=True)
 
     if monitor_state.last_error:
         embed.add_field(name="Last Error", value=monitor_state.last_error[:1024], inline=False)
 
-    embed.set_footer(text="Cost is estimated from configured pricing")
+    embed.set_footer(text="OpenRouter totals are live account credits; local windows come from usage.jsonl")
     return embed
 
 
@@ -313,7 +394,8 @@ async def monitor_command(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("You don't have permission to view bot monitoring.", ephemeral=True)
         return
 
-    await interaction.response.send_message(embed=build_monitor_embed(curr_config), ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    await interaction.followup.send(embed=await build_monitor_embed(curr_config), ephemeral=True)
 
 
 @discord_bot.tree.command(name="model", description="View or switch the current model")
@@ -505,6 +587,7 @@ async def on_message(new_msg: discord.Message) -> None:
     response_contents = []
     prompt_chars = sum(count_content_chars(message["content"]) for message in messages)
     input_tokens = output_tokens = None
+    provider_cost = None
     request_succeeded = False
     error_summary = None
 
@@ -539,9 +622,10 @@ async def on_message(new_msg: discord.Message) -> None:
     try:
         async with new_msg.channel.typing():
             async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
-                chunk_input_tokens, chunk_output_tokens = extract_usage_tokens(getattr(chunk, "usage", None))
+                chunk_input_tokens, chunk_output_tokens, chunk_cost = extract_usage(getattr(chunk, "usage", None))
                 input_tokens = chunk_input_tokens if chunk_input_tokens is not None else input_tokens
                 output_tokens = chunk_output_tokens if chunk_output_tokens is not None else output_tokens
+                provider_cost = chunk_cost if chunk_cost is not None else provider_cost
 
                 if finish_reason != None:
                     break
@@ -605,7 +689,7 @@ async def on_message(new_msg: discord.Message) -> None:
     monitor_state.generated_messages += len(response_msgs)
 
     response_text = "".join(response_contents)
-    input_tokens, output_tokens, estimated_cost = estimate_usage_cost(config, provider_slash_model, prompt_chars, len(response_text), input_tokens, output_tokens)
+    input_tokens, output_tokens, estimated_cost = estimate_usage_cost(config, provider_slash_model, prompt_chars, len(response_text), input_tokens, output_tokens, provider_cost)
     usage_event = dict(
         timestamp=time.time(),
         datetime=datetime.now().astimezone().isoformat(),
@@ -617,6 +701,7 @@ async def on_message(new_msg: discord.Message) -> None:
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         estimated_cost=estimated_cost,
+        provider_cost=provider_cost,
         success=request_succeeded,
         error=error_summary,
     )
