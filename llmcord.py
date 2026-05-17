@@ -33,6 +33,7 @@ MAX_MESSAGE_NODES = 500
 
 SECONDS_PER_HOUR = 60 * 60
 SECONDS_PER_DAY = 24 * SECONDS_PER_HOUR
+SECONDS_PER_WEEK = 7 * SECONDS_PER_DAY
 SECONDS_PER_30_DAYS = 30 * SECONDS_PER_DAY
 
 
@@ -230,6 +231,32 @@ def summarize_costs(events: list[dict[str, Any]]) -> tuple[float, float, float]:
     return total_since(SECONDS_PER_HOUR), total_since(SECONDS_PER_DAY), total_since(SECONDS_PER_30_DAYS)
 
 
+def summarize_token_windows(events: list[dict[str, Any]]) -> dict[str, tuple[int, int]]:
+    now = time.time()
+    windows = {
+        "1h": SECONDS_PER_HOUR,
+        "1w": SECONDS_PER_WEEK,
+        "30d": SECONDS_PER_30_DAYS,
+    }
+
+    summaries = {}
+    for label, seconds in windows.items():
+        cutoff = now - seconds
+        input_tokens = 0
+        output_tokens = 0
+
+        for event in events:
+            if float(event.get("timestamp", 0)) < cutoff:
+                continue
+
+            input_tokens += int(event.get("input_tokens", 0))
+            output_tokens += int(event.get("output_tokens", 0))
+
+        summaries[label] = (input_tokens, output_tokens)
+
+    return summaries
+
+
 def summarize_top_messengers(events: list[dict[str, Any]], limit: int = 5) -> list[tuple[int, int, float]]:
     users = {}
 
@@ -333,6 +360,7 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
     top_messengers = summarize_top_messengers(events)
     top_spenders = summarize_top_spenders(events)
     demand = summarize_demand(events)
+    token_windows = summarize_token_windows(events)
     openrouter_credits = None
     openrouter_error = None
 
@@ -418,6 +446,14 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
             f"Avg time: **{demand['avg_duration_seconds']:.1f}s**"
         ),
         inline=True,
+    )
+    embed.add_field(
+        name="Token Flow",
+        value="\n".join(
+            f"{label}: **{input_tokens:,}** in / **{output_tokens:,}** out"
+            for label, (input_tokens, output_tokens) in token_windows.items()
+        ),
+        inline=False,
     )
     embed.add_field(
         name="Local Spend Estimate",
