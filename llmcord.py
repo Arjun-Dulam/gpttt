@@ -3,6 +3,7 @@ from base64 import b64encode
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
+import os
 from typing import Any, Literal, Optional
 
 import discord
@@ -29,9 +30,35 @@ EDIT_DELAY_SECONDS = 1
 MAX_MESSAGE_NODES = 500
 
 
-def get_config(filename: str = "config.yaml") -> dict[str, Any]:
+def load_env_file(filename: str = ".env") -> None:
+    if not os.path.exists(filename):
+        return
+
     with open(filename, encoding="utf-8") as file:
-        return yaml.safe_load(file)
+        for line in file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+
+
+def resolve_env_values(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: resolve_env_values(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [resolve_env_values(item) for item in value]
+    if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+        return os.environ.get(value[2:-1], "")
+    return value
+
+
+def get_config(filename: str = "config.yaml") -> dict[str, Any]:
+    load_env_file()
+
+    with open(filename, encoding="utf-8") as file:
+        return resolve_env_values(yaml.safe_load(file))
 
 
 config = get_config()
