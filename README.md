@@ -96,6 +96,8 @@ Or run local models with:
 | **allow_dms** | Set to `false` to disable direct message access.<br /><br />Default: `true` |
 | **permissions** | Configure access permissions for `users`, `roles` and `channels`, each with a list of `allowed_ids` and `blocked_ids`.<br /><br />Control which `users` are admins with `admin_ids`. Admins can change the model with `/model` and DM the bot even if `allow_dms` is `false`.<br /><br />**Leave `allowed_ids` empty to allow ALL in that category.**<br /><br />**Role and channel permissions do not affect DMs.**<br /><br />**You can use [category](https://support.discord.com/hc/en-us/articles/115001580171-Channel-Categories-101) IDs to control channel permissions in groups.** |
 
+The rate, spam, prompt size, concurrency, and output token settings are enforced before requests are sent to the LLM. Blocked requests are recorded in the local usage log so `/monitor` can show recent guardrail pressure.
+
 ### LLM settings:
 
 | Setting | Description |

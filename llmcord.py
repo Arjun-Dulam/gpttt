@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from typing import Any, Literal, Optional
 
@@ -112,6 +113,8 @@ class MonitorState:
 
 
 monitor_state = MonitorState()
+user_request_times: dict[int, list[float]] = {}
+user_last_request_time: dict[int, float] = {}
 
 
 def get_admin_ids(curr_config: dict[str, Any]) -> set[int]:
@@ -120,6 +123,12 @@ def get_admin_ids(curr_config: dict[str, Any]) -> set[int]:
 
 def user_is_admin(user_id: int, curr_config: dict[str, Any]) -> bool:
     return user_id in get_admin_ids(curr_config)
+
+
+def get_response_limit_kwargs(curr_config: dict[str, Any]) -> dict[str, int]:
+    if max_output_tokens := curr_config.get("max_output_tokens"):
+        return dict(max_tokens=int(max_output_tokens))
+    return {}
 
 
 def format_duration(seconds: float) -> str:
@@ -322,6 +331,121 @@ def summarize_demand(events: list[dict[str, Any]]) -> dict[str, float]:
     )
 
 
+def summarize_blocked(events: list[dict[str, Any]]) -> dict[str, Any]:
+    now = time.time()
+    last_1h = [event for event in events if event.get("blocked_reason") and float(event.get("timestamp", 0)) >= now - SECONDS_PER_HOUR]
+    reasons = {}
+
+    for event in last_1h:
+        reason = str(event.get("blocked_reason"))
+        reasons[reason] = reasons.get(reason, 0) + 1
+
+    top_reasons = sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[:3]
+    return dict(blocked_1h=len(last_1h), top_reasons=top_reasons)
+
+
+def has_repeated_character_spam(text: str, threshold: int) -> bool:
+    return bool(threshold > 0 and re.search(rf"(.)\1{{{threshold - 1},}}", text))
+
+
+def has_repeated_word_spam(text: str, threshold: int) -> bool:
+    if threshold <= 0:
+        return False
+
+    words = re.findall(r"\b\w+\b", text.lower())
+    if not words:
+        return False
+
+    longest_run = 1
+    curr_run = 1
+
+    for prev_word, word in zip(words, words[1:]):
+        curr_run = curr_run + 1 if word == prev_word else 1
+        longest_run = max(longest_run, curr_run)
+
+    return longest_run >= threshold
+
+
+def get_spam_block_reason(text: str, curr_config: dict[str, Any]) -> Optional[str]:
+    normalized_text = text.lower()
+
+    for pattern in curr_config.get("blocked_request_patterns", []):
+        if pattern.lower() in normalized_text:
+            return "blocked_phrase"
+
+    if has_repeated_character_spam(text, int(curr_config.get("spam_repeat_char_threshold", 0))):
+        return "repeated_characters"
+
+    if has_repeated_word_spam(text, int(curr_config.get("spam_repeat_word_threshold", 0))):
+        return "repeated_words"
+
+    return None
+
+
+def reserve_user_request(user_id: int, curr_config: dict[str, Any]) -> Optional[str]:
+    now = time.time()
+    cooldown = float(curr_config.get("per_user_cooldown_seconds", 0))
+    last_request = user_last_request_time.get(user_id)
+
+    if cooldown > 0 and last_request and now - last_request < cooldown:
+        return "cooldown"
+
+    window = float(curr_config.get("rate_limit_window_seconds", 60))
+    limit = int(curr_config.get("rate_limit_per_user", 0))
+    request_times = [timestamp for timestamp in user_request_times.get(user_id, []) if now - timestamp < window]
+
+    if limit > 0 and len(request_times) >= limit:
+        user_request_times[user_id] = request_times
+        return "rate_limit"
+
+    request_times.append(now)
+    user_request_times[user_id] = request_times
+    user_last_request_time[user_id] = now
+    return None
+
+
+def get_guardrail_message(reason: str) -> str:
+    messages = dict(
+        blocked_phrase="That request looks like a token-burner, so I’m not sending it to the model.",
+        repeated_characters="That message looks like repeated-character spam, so I’m not sending it to the model.",
+        repeated_words="That message looks like repeated-word spam, so I’m not sending it to the model.",
+        cooldown="Slow down a bit. You’re sending requests too quickly.",
+        rate_limit="You’ve hit the short-term request limit. Try again in a minute.",
+        global_concurrency="The bot is already handling too many generations. Try again shortly.",
+        prompt_too_large="That prompt/context is too large for this server’s bot limits.",
+    )
+    return messages.get(reason, "That request was blocked by the bot guardrails.")
+
+
+async def reply_with_guardrail_warning(new_msg: discord.Message, reason: str) -> None:
+    await new_msg.reply(get_guardrail_message(reason), silent=True)
+
+
+async def log_blocked_event(curr_config: dict[str, Any], new_msg: discord.Message, model_name: str, reason: str, prompt_chars: int = 0) -> None:
+    usage_event = dict(
+        timestamp=time.time(),
+        datetime=datetime.now().astimezone().isoformat(),
+        user_id=new_msg.author.id,
+        channel_id=new_msg.channel.id,
+        model=model_name,
+        prompt_chars=prompt_chars,
+        response_chars=0,
+        input_tokens=0,
+        output_tokens=0,
+        estimated_cost=0,
+        provider_cost=None,
+        duration_seconds=0,
+        success=False,
+        blocked_reason=reason,
+        error=None,
+    )
+
+    try:
+        await asyncio.to_thread(append_usage_event, curr_config, usage_event)
+    except Exception:
+        logging.exception("Error while writing blocked usage event")
+
+
 def extract_usage(usage: Any) -> tuple[Optional[int], Optional[int], Optional[float]]:
     if usage is None:
         return None, None, None
@@ -369,6 +493,7 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
     top_messengers = summarize_top_messengers(events)
     top_spenders = summarize_top_spenders(events)
     demand = summarize_demand(events)
+    blocked = summarize_blocked(events)
     token_windows = summarize_token_windows(events)
     openrouter_credits = None
     openrouter_error = None
@@ -434,6 +559,7 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
             f"Last 5m       {demand['requests_5m']:>8.0f} req\n"
             f"Last 1h       {demand['requests_1h']:>8.0f} req\n"
             f"Rate          {demand['requests_per_minute_1h']:>8.2f}/min\n"
+            f"Blocked 1h    {blocked['blocked_1h']:>8.0f}\n"
             f"24h burn      {format_money(demand['projected_daily_cost']):>8}\n"
             "```"
         ),
@@ -522,6 +648,10 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
         for index, (user_id, cost, count) in enumerate(top_spenders, start=1)
     )
     embed.add_field(name="$ Top Spenders, 30d", value=spend_leaderboard or "No usage yet", inline=True)
+
+    if blocked["top_reasons"]:
+        blocked_reasons = "\n".join(f"`{reason}`: **{count}**" for reason, count in blocked["top_reasons"])
+        embed.add_field(name="! Top Blocks, 1h", value=blocked_reasons, inline=True)
 
     if monitor_state.last_error:
         embed.add_field(name="! Last Error", value=monitor_state.last_error[:1024], inline=False)
@@ -619,6 +749,13 @@ async def on_message(new_msg: discord.Message) -> None:
 
     provider_slash_model = curr_model
     provider, model = provider_slash_model.removesuffix(":vision").split("/", 1)
+
+    if not user_is_admin:
+        cleaned_new_msg_content = new_msg.content.removeprefix(discord_bot.user.mention).lstrip()
+        if block_reason := get_spam_block_reason(cleaned_new_msg_content, config):
+            await reply_with_guardrail_warning(new_msg, block_reason)
+            await log_blocked_event(config, new_msg, provider_slash_model, block_reason, len(cleaned_new_msg_content))
+            return
 
     provider_config = config["providers"][provider]
 
@@ -735,11 +872,30 @@ async def on_message(new_msg: discord.Message) -> None:
     request_succeeded = False
     error_summary = None
 
+    if max_prompt_chars := config.get("max_prompt_chars"):
+        if prompt_chars > int(max_prompt_chars):
+            await reply_with_guardrail_warning(new_msg, "prompt_too_large")
+            await log_blocked_event(config, new_msg, provider_slash_model, "prompt_too_large", prompt_chars)
+            return
+
+    if concurrency_limit := config.get("global_concurrency_limit"):
+        if monitor_state.active_generations >= int(concurrency_limit):
+            await reply_with_guardrail_warning(new_msg, "global_concurrency")
+            await log_blocked_event(config, new_msg, provider_slash_model, "global_concurrency", prompt_chars)
+            return
+
+    if not user_is_admin:
+        if block_reason := reserve_user_request(new_msg.author.id, config):
+            await reply_with_guardrail_warning(new_msg, block_reason)
+            await log_blocked_event(config, new_msg, provider_slash_model, block_reason, prompt_chars)
+            return
+
     openai_kwargs = dict(
         model=model,
         messages=messages[::-1],
         stream=True,
         stream_options=dict(include_usage=True),
+        **get_response_limit_kwargs(config),
         extra_headers=extra_headers,
         extra_query=extra_query,
         extra_body=extra_body,
