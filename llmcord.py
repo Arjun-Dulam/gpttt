@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import json
 import logging
+import math
 import os
 import time
 from typing import Any, Literal, Optional
@@ -150,6 +151,14 @@ def format_money(amount: float) -> str:
 
 def format_number(value: float) -> str:
     return f"{value:,.0f}" if value == int(value) else f"{value:,.2f}"
+
+
+def format_meter(value: float, total: float, width: int = 12) -> str:
+    if total <= 0:
+        return "[" + "-" * width + "]"
+
+    filled = min(width, max(0, round(width * value / total)))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
 
 
 def count_content_chars(content: Any) -> int:
@@ -374,100 +383,128 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
     busy_threshold = concurrency_limit * 0.75 if concurrency_limit else float("inf")
 
     if monitor_state.last_error:
-        health_label = "Error"
+        health_label = "ERROR"
         color = discord.Color.red()
     elif monitor_state.active_generations >= busy_threshold:
-        health_label = "Busy"
+        health_label = "BUSY"
         color = discord.Color.gold()
     else:
-        health_label = "Healthy"
+        health_label = "HEALTHY"
         color = discord.Color.green()
 
     uptime = format_duration((datetime.now().astimezone() - monitor_state.start_time).total_seconds())
-    latency_ms = round(discord_bot.latency * 1000)
+    latency_ms = round(discord_bot.latency * 1000) if math.isfinite(discord_bot.latency) else None
+    latency_display = f"{latency_ms} ms" if latency_ms is not None else "n/a"
     success_count = max(0, monitor_state.llm_requests - monitor_state.failed_llm_requests)
     success_rate = (success_count / monitor_state.llm_requests * 100) if monitor_state.llm_requests else 100
     total_tokens_30d = sum(int(event.get("input_tokens", 0)) + int(event.get("output_tokens", 0)) for event in events)
+    load_meter = format_meter(monitor_state.active_generations, concurrency_limit) if concurrency_limit else "[unlimited]"
+    reliability_meter = format_meter(success_rate, 100)
+    balance_meter = ""
+
+    if openrouter_credits and openrouter_credits["total_credits"] > 0:
+        balance_meter = format_meter(openrouter_credits["balance"], openrouter_credits["total_credits"])
 
     embed = discord.Embed(
         title="Bot Monitor",
         description=(
-            f"**{health_label}**\n"
-            f"`{curr_model}`\n"
-            f"Up for **{uptime}** with **{latency_ms} ms** gateway latency."
+            f"**{health_label}**  |  `{curr_model}`\n"
+            f"Uptime **{uptime}**  |  Gateway **{latency_display}**  |  Active **{monitor_state.active_generations}/{concurrency_limit or 'unlimited'}**"
         ),
         color=color,
         timestamp=datetime.now().astimezone(),
     )
 
     embed.add_field(
-        name="Live Load",
+        name="Overview",
         value=(
-            f"Active: **{monitor_state.active_generations} / {concurrency_limit or 'unlimited'}**\n"
-            f"Peak active: **{monitor_state.peak_active_generations}**\n"
-            f"Cache: **{len(msg_nodes)} / {MAX_MESSAGE_NODES}**\n"
-            f"Last request: **{format_timestamp(monitor_state.last_request_time)}**"
+            "```text\n"
+            f"Load        {load_meter} {monitor_state.active_generations}/{concurrency_limit or 'unlimited'}\n"
+            f"Reliability {reliability_meter} {success_rate:.1f}%\n"
+            f"Cache       {len(msg_nodes):>4} / {MAX_MESSAGE_NODES:<4}\n"
+            f"Peak active {monitor_state.peak_active_generations:>4}\n"
+            "```"
         ),
         inline=False,
     )
     embed.add_field(
         name="Demand Pressure",
         value=(
-            f"Last 5m: **{demand['requests_5m']:.0f}** req\n"
-            f"Last 1h: **{demand['requests_1h']:.0f}** req ({demand['requests_per_minute_1h']:.2f}/min)\n"
-            f"Projected daily burn: **{format_money(demand['projected_daily_cost'])}**"
+            "```text\n"
+            f"Last 5m       {demand['requests_5m']:>8.0f} req\n"
+            f"Last 1h       {demand['requests_1h']:>8.0f} req\n"
+            f"Rate          {demand['requests_per_minute_1h']:>8.2f}/min\n"
+            f"24h burn      {format_money(demand['projected_daily_cost']):>8}\n"
+            "```"
         ),
-        inline=False,
+        inline=True,
     )
     embed.add_field(
         name="Traffic",
         value=(
-            f"Messages seen: **{monitor_state.messages_seen:,}**\n"
-            f"LLM requests: **{monitor_state.llm_requests:,}**\n"
-            f"Generated replies: **{monitor_state.generated_messages:,}**"
+            "```text\n"
+            f"Messages      {monitor_state.messages_seen:>8,}\n"
+            f"LLM calls     {monitor_state.llm_requests:>8,}\n"
+            f"Replies       {monitor_state.generated_messages:>8,}\n"
+            f"Failures      {monitor_state.failed_llm_requests:>8,}\n"
+            "```"
         ),
         inline=True,
     )
     embed.add_field(
         name="Reliability",
         value=(
-            f"Success rate: **{success_rate:.1f}%**\n"
-            f"1h failure rate: **{demand['failure_rate_1h']:.1f}%**\n"
-            f"Total failures: **{monitor_state.failed_llm_requests:,}**\n"
-            f"30d tokens: **{total_tokens_30d:,}**"
+            "```text\n"
+            f"Success       {success_rate:>7.1f}%\n"
+            f"1h failures   {demand['failure_rate_1h']:>7.1f}%\n"
+            f"30d tokens    {total_tokens_30d:>8,}\n"
+            "```"
         ),
         inline=True,
     )
     embed.add_field(
         name="Request Shape, 1h",
         value=(
-            f"Avg cost: **{format_money(demand['avg_cost_per_request'])}**\n"
-            f"Avg tokens: **{format_number(demand['avg_tokens_per_request'])}**\n"
-            f"Avg time: **{demand['avg_duration_seconds']:.1f}s**"
+            "```text\n"
+            f"Avg cost      {format_money(demand['avg_cost_per_request']):>8}\n"
+            f"Avg tokens    {format_number(demand['avg_tokens_per_request']):>8}\n"
+            f"Avg time      {demand['avg_duration_seconds']:>7.1f}s\n"
+            "```"
         ),
         inline=True,
     )
     embed.add_field(
         name="Token Flow",
-        value="\n".join(
-            f"{label}: **{input_tokens:,}** in / **{output_tokens:,}** out"
+        value="```text\n"
+        + "\n".join(
+            f"{label:<3}  in {input_tokens:>10,}   out {output_tokens:>10,}"
             for label, (input_tokens, output_tokens) in token_windows.items()
-        ),
+        )
+        + "\n```",
         inline=False,
     )
     embed.add_field(
-        name="Local Spend Estimate",
-        value=f"Last hour: **{format_money(hour_cost)}**\nLast day: **{format_money(day_cost)}**\nLast 30 days: **{format_money(month_cost)}**",
-        inline=False,
+        name="Spend Windows",
+        value=(
+            "```text\n"
+            f"Last hour     {format_money(hour_cost):>8}\n"
+            f"Last day      {format_money(day_cost):>8}\n"
+            f"Last 30 days  {format_money(month_cost):>8}\n"
+            "```"
+        ),
+        inline=True,
     )
 
     if openrouter_credits:
         embed.add_field(
             name="OpenRouter Account",
             value=(
-                f"Balance: **{format_money(openrouter_credits['balance'])}**\n"
-                f"Total credits: **{format_money(openrouter_credits['total_credits'])}**\n"
-                f"Total usage: **{format_money(openrouter_credits['total_usage'])}**"
+                "```text\n"
+                f"Balance      {format_money(openrouter_credits['balance']):>8}\n"
+                f"Credits      {format_money(openrouter_credits['total_credits']):>8}\n"
+                f"Used         {format_money(openrouter_credits['total_usage']):>8}\n"
+                f"{balance_meter}\n"
+                "```"
             ),
             inline=True,
         )
@@ -475,13 +512,13 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
         embed.add_field(name="OpenRouter Account", value=f"Unavailable: `{openrouter_error[:180]}`", inline=True)
 
     leaderboard = "\n".join(
-        f"**{index}.** <@{user_id}> - **{count}** req, **{format_money(cost)}**"
+        f"`{index}.` <@{user_id}>  **{count}** req  **{format_money(cost)}**"
         for index, (user_id, count, cost) in enumerate(top_messengers, start=1)
     )
     embed.add_field(name="Top Messengers, 30d", value=leaderboard or "No usage yet", inline=True)
 
     spend_leaderboard = "\n".join(
-        f"**{index}.** <@{user_id}> - **{format_money(cost)}**, **{count}** req"
+        f"`{index}.` <@{user_id}>  **{format_money(cost)}**  **{count}** req"
         for index, (user_id, cost, count) in enumerate(top_spenders, start=1)
     )
     embed.add_field(name="Top Spenders, 30d", value=spend_leaderboard or "No usage yet", inline=True)
