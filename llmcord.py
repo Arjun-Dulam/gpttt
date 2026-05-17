@@ -2,8 +2,10 @@ import asyncio
 from base64 import b64encode
 from dataclasses import dataclass, field
 from datetime import datetime
+import json
 import logging
 import os
+import time
 from typing import Any, Literal, Optional
 
 import discord
@@ -28,6 +30,10 @@ STREAMING_INDICATOR = " ⚪"
 EDIT_DELAY_SECONDS = 1
 
 MAX_MESSAGE_NODES = 500
+
+SECONDS_PER_HOUR = 60 * 60
+SECONDS_PER_DAY = 24 * SECONDS_PER_HOUR
+SECONDS_PER_30_DAYS = 30 * SECONDS_PER_DAY
 
 
 def load_env_file(filename: str = ".env") -> None:
@@ -90,6 +96,226 @@ class MsgNode:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+@dataclass
+class MonitorState:
+    start_time: datetime = field(default_factory=lambda: datetime.now().astimezone())
+    messages_seen: int = 0
+    llm_requests: int = 0
+    failed_llm_requests: int = 0
+    generated_messages: int = 0
+    active_generations: int = 0
+    last_request_time: Optional[datetime] = None
+    last_error: Optional[str] = None
+
+
+monitor_state = MonitorState()
+
+
+def get_admin_ids(curr_config: dict[str, Any]) -> set[int]:
+    return set(curr_config["permissions"]["users"]["admin_ids"])
+
+
+def user_is_admin(user_id: int, curr_config: dict[str, Any]) -> bool:
+    return user_id in get_admin_ids(curr_config)
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    days, seconds = divmod(seconds, SECONDS_PER_DAY)
+    hours, seconds = divmod(seconds, SECONDS_PER_HOUR)
+    minutes, seconds = divmod(seconds, 60)
+
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if not parts:
+        parts.append(f"{seconds}s")
+
+    return " ".join(parts[:2])
+
+
+def format_timestamp(dt: Optional[datetime]) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S %Z") if dt else "Never"
+
+
+def format_money(amount: float) -> str:
+    return f"${amount:.4f}" if amount < 1 else f"${amount:.2f}"
+
+
+def count_content_chars(content: Any) -> int:
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        return sum(count_content_chars(item.get("text", "")) for item in content if isinstance(item, dict))
+    return 0
+
+
+def estimate_tokens(chars: int, multiplier: float) -> int:
+    return max(0, round(chars * multiplier))
+
+
+def get_model_prices(curr_config: dict[str, Any], model_name: str) -> tuple[float, float]:
+    prices = (curr_config.get("cost_estimation") or {}).get("model_prices") or {}
+    model_prices = prices.get(model_name) or {}
+    return float(model_prices.get("input_per_million", 0)), float(model_prices.get("output_per_million", 0))
+
+
+def calculate_cost(curr_config: dict[str, Any], model_name: str, input_tokens: int, output_tokens: int) -> float:
+    input_price, output_price = get_model_prices(curr_config, model_name)
+    return (input_tokens / 1_000_000 * input_price) + (output_tokens / 1_000_000 * output_price)
+
+
+def estimate_usage_cost(
+    curr_config: dict[str, Any],
+    model_name: str,
+    prompt_chars: int,
+    response_chars: int,
+    input_tokens: Optional[int],
+    output_tokens: Optional[int],
+) -> tuple[int, int, float]:
+    cost_config = curr_config.get("cost_estimation") or {}
+    input_token_count = input_tokens if input_tokens is not None else estimate_tokens(prompt_chars, float(cost_config.get("input_tokens_per_char", 0.25)))
+    output_token_count = output_tokens if output_tokens is not None else estimate_tokens(response_chars, float(cost_config.get("output_tokens_per_char", 0.25)))
+    return input_token_count, output_token_count, calculate_cost(curr_config, model_name, input_token_count, output_token_count)
+
+
+def get_usage_log_path(curr_config: dict[str, Any]) -> str:
+    return curr_config.get("usage_log_path", "usage.jsonl")
+
+
+def append_usage_event(curr_config: dict[str, Any], event: dict[str, Any]) -> None:
+    with open(get_usage_log_path(curr_config), "a", encoding="utf-8") as file:
+        file.write(json.dumps(event, separators=(",", ":")) + "\n")
+
+
+def load_usage_events(curr_config: dict[str, Any], since_seconds: int = SECONDS_PER_30_DAYS) -> list[dict[str, Any]]:
+    path = get_usage_log_path(curr_config)
+    if not os.path.exists(path):
+        return []
+
+    cutoff = time.time() - since_seconds
+    events = []
+
+    with open(path, encoding="utf-8") as file:
+        for line in file:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if float(event.get("timestamp", 0)) >= cutoff:
+                events.append(event)
+
+    return events
+
+
+def summarize_costs(events: list[dict[str, Any]]) -> tuple[float, float, float]:
+    now = time.time()
+
+    def total_since(seconds: int) -> float:
+        cutoff = now - seconds
+        return sum(float(event.get("estimated_cost", 0)) for event in events if float(event.get("timestamp", 0)) >= cutoff)
+
+    return total_since(SECONDS_PER_HOUR), total_since(SECONDS_PER_DAY), total_since(SECONDS_PER_30_DAYS)
+
+
+def summarize_top_messengers(events: list[dict[str, Any]], limit: int = 5) -> list[tuple[int, int, float]]:
+    users = {}
+
+    for event in events:
+        if not event.get("success"):
+            continue
+
+        user_id = int(event["user_id"])
+        count, cost = users.get(user_id, (0, 0.0))
+        users[user_id] = (count + 1, cost + float(event.get("estimated_cost", 0)))
+
+    return sorted(((user_id, count, cost) for user_id, (count, cost) in users.items()), key=lambda item: (-item[1], -item[2], item[0]))[:limit]
+
+
+def extract_usage_tokens(usage: Any) -> tuple[Optional[int], Optional[int]]:
+    if usage is None:
+        return None, None
+
+    input_tokens = getattr(usage, "prompt_tokens", None)
+    output_tokens = getattr(usage, "completion_tokens", None)
+
+    if isinstance(usage, dict):
+        input_tokens = usage.get("prompt_tokens")
+        output_tokens = usage.get("completion_tokens")
+
+    return input_tokens, output_tokens
+
+
+def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
+    events = load_usage_events(curr_config)
+    hour_cost, day_cost, month_cost = summarize_costs(events)
+    top_messengers = summarize_top_messengers(events)
+
+    concurrency_limit = curr_config.get("global_concurrency_limit", 0)
+    busy_threshold = concurrency_limit * 0.75 if concurrency_limit else float("inf")
+
+    if monitor_state.last_error:
+        health_label = "Error"
+        color = discord.Color.red()
+    elif monitor_state.active_generations >= busy_threshold:
+        health_label = "Busy"
+        color = discord.Color.gold()
+    else:
+        health_label = "Healthy"
+        color = discord.Color.green()
+
+    uptime = format_duration((datetime.now().astimezone() - monitor_state.start_time).total_seconds())
+    latency_ms = round(discord_bot.latency * 1000)
+
+    embed = discord.Embed(
+        title="Bot Monitor",
+        description=f"Status: **{health_label}**",
+        color=color,
+        timestamp=datetime.now().astimezone(),
+    )
+
+    embed.add_field(name="Model", value=f"`{curr_model}`", inline=False)
+    embed.add_field(name="Uptime", value=uptime, inline=True)
+    embed.add_field(name="Latency", value=f"{latency_ms} ms", inline=True)
+    embed.add_field(name="Active", value=str(monitor_state.active_generations), inline=True)
+    embed.add_field(name="Cache", value=f"{len(msg_nodes)} / {MAX_MESSAGE_NODES}", inline=True)
+    embed.add_field(name="Messages Seen", value=f"{monitor_state.messages_seen:,}", inline=True)
+    embed.add_field(name="LLM Requests", value=f"{monitor_state.llm_requests:,}", inline=True)
+    embed.add_field(name="Failures", value=f"{monitor_state.failed_llm_requests:,}", inline=True)
+    embed.add_field(name="Generated", value=f"{monitor_state.generated_messages:,}", inline=True)
+    embed.add_field(name="Last Request", value=format_timestamp(monitor_state.last_request_time), inline=False)
+    embed.add_field(
+        name="Estimated Cost",
+        value=f"Last hour: **{format_money(hour_cost)}**\nLast day: **{format_money(day_cost)}**\nLast 30 days: **{format_money(month_cost)}**",
+        inline=True,
+    )
+
+    leaderboard = "\n".join(f"{index}. <@{user_id}> - {count} requests, {format_money(cost)}" for index, (user_id, count, cost) in enumerate(top_messengers, start=1))
+    embed.add_field(name="Top Messengers, 30d", value=leaderboard or "No usage yet", inline=True)
+
+    if monitor_state.last_error:
+        embed.add_field(name="Last Error", value=monitor_state.last_error[:1024], inline=False)
+
+    embed.set_footer(text="Cost is estimated from configured pricing")
+    return embed
+
+
+@discord_bot.tree.command(name="monitor", description="View bot health, usage, cost, and top messengers")
+async def monitor_command(interaction: discord.Interaction) -> None:
+    curr_config = await asyncio.to_thread(get_config)
+
+    if not user_is_admin(interaction.user.id, curr_config):
+        await interaction.response.send_message("You don't have permission to view bot monitoring.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(embed=build_monitor_embed(curr_config), ephemeral=True)
+
+
 @discord_bot.tree.command(name="model", description="View or switch the current model")
 async def model_command(interaction: discord.Interaction, model: str) -> None:
     global curr_model
@@ -97,7 +323,7 @@ async def model_command(interaction: discord.Interaction, model: str) -> None:
     if model == curr_model:
         output = f"Current model: `{curr_model}`"
     else:
-        if user_is_admin := interaction.user.id in config["permissions"]["users"]["admin_ids"]:
+        if user_is_admin := interaction.user.id in get_admin_ids(config):
             curr_model = model
             output = f"Model switched to: `{model}`"
             logging.info(output)
@@ -137,6 +363,8 @@ async def on_message(new_msg: discord.Message) -> None:
     if (not is_dm and discord_bot.user not in new_msg.mentions) or new_msg.author.bot:
         return
 
+    monitor_state.messages_seen += 1
+
     role_ids = set(role.id for role in getattr(new_msg.author, "roles", ()))
     channel_ids = set(filter(None, (new_msg.channel.id, getattr(new_msg.channel, "parent_id", None), getattr(new_msg.channel, "category_id", None))))
 
@@ -146,7 +374,7 @@ async def on_message(new_msg: discord.Message) -> None:
 
     permissions = config["permissions"]
 
-    user_is_admin = new_msg.author.id in permissions["users"]["admin_ids"]
+    user_is_admin = new_msg.author.id in get_admin_ids(config)
 
     (allowed_user_ids, blocked_user_ids), (allowed_role_ids, blocked_role_ids), (allowed_channel_ids, blocked_channel_ids) = (
         (perm["allowed_ids"], perm["blocked_ids"]) for perm in (permissions["users"], permissions["roles"], permissions["channels"])
@@ -275,8 +503,20 @@ async def on_message(new_msg: discord.Message) -> None:
     curr_content = finish_reason = None
     response_msgs = []
     response_contents = []
+    prompt_chars = sum(count_content_chars(message["content"]) for message in messages)
+    input_tokens = output_tokens = None
+    request_succeeded = False
+    error_summary = None
 
-    openai_kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
+    openai_kwargs = dict(
+        model=model,
+        messages=messages[::-1],
+        stream=True,
+        stream_options=dict(include_usage=True),
+        extra_headers=extra_headers,
+        extra_query=extra_query,
+        extra_body=extra_body,
+    )
 
     if use_plain_responses := config.get("use_plain_responses", False):
         max_message_length = 4000
@@ -292,9 +532,17 @@ async def on_message(new_msg: discord.Message) -> None:
         msg_nodes[response_msg.id] = MsgNode(parent_msg=new_msg)
         await msg_nodes[response_msg.id].lock.acquire()
 
+    monitor_state.llm_requests += 1
+    monitor_state.active_generations += 1
+    monitor_state.last_request_time = datetime.now().astimezone()
+
     try:
         async with new_msg.channel.typing():
             async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
+                chunk_input_tokens, chunk_output_tokens = extract_usage_tokens(getattr(chunk, "usage", None))
+                input_tokens = chunk_input_tokens if chunk_input_tokens is not None else input_tokens
+                output_tokens = chunk_output_tokens if chunk_output_tokens is not None else output_tokens
+
                 if finish_reason != None:
                     break
 
@@ -340,12 +588,43 @@ async def on_message(new_msg: discord.Message) -> None:
                 for content in response_contents:
                     await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
 
-    except Exception:
+        request_succeeded = True
+        monitor_state.last_error = None
+
+    except Exception as exc:
         logging.exception("Error while generating response")
+        monitor_state.failed_llm_requests += 1
+        error_summary = f"{type(exc).__name__}: {exc}"
+        monitor_state.last_error = error_summary
 
     for response_msg in response_msgs:
         msg_nodes[response_msg.id].text = "".join(response_contents)
         msg_nodes[response_msg.id].lock.release()
+
+    monitor_state.active_generations = max(0, monitor_state.active_generations - 1)
+    monitor_state.generated_messages += len(response_msgs)
+
+    response_text = "".join(response_contents)
+    input_tokens, output_tokens, estimated_cost = estimate_usage_cost(config, provider_slash_model, prompt_chars, len(response_text), input_tokens, output_tokens)
+    usage_event = dict(
+        timestamp=time.time(),
+        datetime=datetime.now().astimezone().isoformat(),
+        user_id=new_msg.author.id,
+        channel_id=new_msg.channel.id,
+        model=provider_slash_model,
+        prompt_chars=prompt_chars,
+        response_chars=len(response_text),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        estimated_cost=estimated_cost,
+        success=request_succeeded,
+        error=error_summary,
+    )
+
+    try:
+        await asyncio.to_thread(append_usage_event, config, usage_event)
+    except Exception:
+        logging.exception("Error while writing usage event")
 
     # Delete oldest MsgNodes (lowest message IDs) from the cache
     if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:
