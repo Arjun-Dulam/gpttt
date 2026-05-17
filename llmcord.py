@@ -155,10 +155,10 @@ def format_number(value: float) -> str:
 
 def format_meter(value: float, total: float, width: int = 12) -> str:
     if total <= 0:
-        return "[" + "-" * width + "]"
+        return "░" * width
 
     filled = min(width, max(0, round(width * value / total)))
-    return "[" + "#" * filled + "-" * (width - filled) + "]"
+    return "█" * filled + "░" * (width - filled)
 
 
 def count_content_chars(content: Any) -> int:
@@ -383,13 +383,13 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
     busy_threshold = concurrency_limit * 0.75 if concurrency_limit else float("inf")
 
     if monitor_state.last_error:
-        health_label = "ERROR"
+        health_label = "RED ERROR"
         color = discord.Color.red()
     elif monitor_state.active_generations >= busy_threshold:
-        health_label = "BUSY"
+        health_label = "YELLOW BUSY"
         color = discord.Color.gold()
     else:
-        health_label = "HEALTHY"
+        health_label = "GREEN HEALTHY"
         color = discord.Color.green()
 
     uptime = format_duration((datetime.now().astimezone() - monitor_state.start_time).total_seconds())
@@ -398,7 +398,7 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
     success_count = max(0, monitor_state.llm_requests - monitor_state.failed_llm_requests)
     success_rate = (success_count / monitor_state.llm_requests * 100) if monitor_state.llm_requests else 100
     total_tokens_30d = sum(int(event.get("input_tokens", 0)) + int(event.get("output_tokens", 0)) for event in events)
-    load_meter = format_meter(monitor_state.active_generations, concurrency_limit) if concurrency_limit else "[unlimited]"
+    load_meter = format_meter(monitor_state.active_generations, concurrency_limit) if concurrency_limit else "unlimited"
     reliability_meter = format_meter(success_rate, 100)
     balance_meter = ""
 
@@ -416,7 +416,7 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
     )
 
     embed.add_field(
-        name="Overview",
+        name="▣ Status Overview",
         value=(
             "```text\n"
             f"Load        {load_meter} {monitor_state.active_generations}/{concurrency_limit or 'unlimited'}\n"
@@ -428,7 +428,7 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
         inline=False,
     )
     embed.add_field(
-        name="Demand Pressure",
+        name="▲ Demand Pressure",
         value=(
             "```text\n"
             f"Last 5m       {demand['requests_5m']:>8.0f} req\n"
@@ -440,7 +440,7 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
         inline=True,
     )
     embed.add_field(
-        name="Traffic",
+        name="◆ Traffic",
         value=(
             "```text\n"
             f"Messages      {monitor_state.messages_seen:>8,}\n"
@@ -452,7 +452,7 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
         inline=True,
     )
     embed.add_field(
-        name="Reliability",
+        name="■ Reliability",
         value=(
             "```text\n"
             f"Success       {success_rate:>7.1f}%\n"
@@ -463,7 +463,7 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
         inline=True,
     )
     embed.add_field(
-        name="Request Shape, 1h",
+        name="◈ Request Shape, 1h",
         value=(
             "```text\n"
             f"Avg cost      {format_money(demand['avg_cost_per_request']):>8}\n"
@@ -474,7 +474,7 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
         inline=True,
     )
     embed.add_field(
-        name="Token Flow",
+        name="▥ Token Flow",
         value="```text\n"
         + "\n".join(
             f"{label:<3}  in {input_tokens:>10,}   out {output_tokens:>10,}"
@@ -484,7 +484,7 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
         inline=False,
     )
     embed.add_field(
-        name="Spend Windows",
+        name="$ Spend Windows",
         value=(
             "```text\n"
             f"Last hour     {format_money(hour_cost):>8}\n"
@@ -497,7 +497,7 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
 
     if openrouter_credits:
         embed.add_field(
-            name="OpenRouter Account",
+            name="◎ OpenRouter Account",
             value=(
                 "```text\n"
                 f"Balance      {format_money(openrouter_credits['balance']):>8}\n"
@@ -509,22 +509,22 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
             inline=True,
         )
     elif openrouter_error:
-        embed.add_field(name="OpenRouter Account", value=f"Unavailable: `{openrouter_error[:180]}`", inline=True)
+        embed.add_field(name="◎ OpenRouter Account", value=f"Unavailable: `{openrouter_error[:180]}`", inline=True)
 
     leaderboard = "\n".join(
         f"`{index}.` <@{user_id}>  **{count}** req  **{format_money(cost)}**"
         for index, (user_id, count, cost) in enumerate(top_messengers, start=1)
     )
-    embed.add_field(name="Top Messengers, 30d", value=leaderboard or "No usage yet", inline=True)
+    embed.add_field(name="★ Top Messengers, 30d", value=leaderboard or "No usage yet", inline=True)
 
     spend_leaderboard = "\n".join(
         f"`{index}.` <@{user_id}>  **{format_money(cost)}**  **{count}** req"
         for index, (user_id, cost, count) in enumerate(top_spenders, start=1)
     )
-    embed.add_field(name="Top Spenders, 30d", value=spend_leaderboard or "No usage yet", inline=True)
+    embed.add_field(name="$ Top Spenders, 30d", value=spend_leaderboard or "No usage yet", inline=True)
 
     if monitor_state.last_error:
-        embed.add_field(name="Last Error", value=monitor_state.last_error[:1024], inline=False)
+        embed.add_field(name="! Last Error", value=monitor_state.last_error[:1024], inline=False)
 
     embed.set_footer(text="OpenRouter totals are live account credits; local windows come from usage.jsonl")
     return embed
