@@ -81,9 +81,22 @@ Or run local models with:
 | **max_text** | The maximum amount of text allowed in a single message, including text from file attachments.<br /><br />Default: `100,000` |
 | **max_images** | The maximum number of image attachments allowed in a single message.<br /><br />Default: `5`<br /><br />**Only applicable when using a vision model.** |
 | **max_messages** | The maximum number of messages allowed in a reply chain. When exceeded, the oldest messages are dropped.<br /><br />Default: `25` |
+| **rate_limit_per_user** | The maximum number of accepted bot requests each user can make during `rate_limit_window_seconds`.<br /><br />Suggested fast-server default: `5` |
+| **rate_limit_window_seconds** | The rolling window used by `rate_limit_per_user`, in seconds.<br /><br />Suggested fast-server default: `60` |
+| **per_user_cooldown_seconds** | The minimum delay between accepted bot requests from the same user.<br /><br />Suggested fast-server default: `7` |
+| **global_concurrency_limit** | The maximum number of LLM generations the bot should run at the same time across the server.<br /><br />Suggested fast-server default: `4` |
+| **max_prompt_chars** | The maximum prompt/context size to allow before warning or limiting a request.<br /><br />Suggested fast-server default: `3,000` |
+| **max_output_tokens** | The maximum number of output tokens to request from the model, which helps cap cost and prevents runaway responses.<br /><br />Suggested fast-server default: `500` |
+| **spam_repeat_char_threshold** | The repeated-character threshold for detecting messages like long runs of `0` or `a`.<br /><br />Suggested fast-server default: `50` |
+| **spam_repeat_word_threshold** | The repeated-word threshold for detecting messages like `0 0 0...` or repeated phrases.<br /><br />Suggested fast-server default: `20` |
+| **usage_log_path** | Local JSONL file used for `/monitor` usage history, cost windows, token flow, demand pressure, request shape, and top messenger/spender stats.<br /><br />Suggested default: `usage.jsonl` |
+| **cost_estimation** | Configures `/monitor` cost estimates with fallback token-per-character ratios and per-model `input_per_million` / `output_per_million` prices. OpenRouter usage accounting is used when available, and `/monitor` also fetches live OpenRouter credit balance for OpenRouter-backed models. |
+| **blocked_request_patterns** | A list of phrases that should be treated as wasteful prompt patterns, such as `repeat forever`, `recite the whole`, `write the entire book`, `print 10000`, `repeat 0`, `infinite`, and `as long as possible`. |
 | **use_plain_responses** | When set to `true` the bot will use plaintext responses instead of embeds. Plaintext responses have a shorter character limit so the bot's messages may split more often.<br /><br />Default: `false`<br /><br />**Also disables streamed responses and warning messages.** |
 | **allow_dms** | Set to `false` to disable direct message access.<br /><br />Default: `true` |
 | **permissions** | Configure access permissions for `users`, `roles` and `channels`, each with a list of `allowed_ids` and `blocked_ids`.<br /><br />Control which `users` are admins with `admin_ids`. Admins can change the model with `/model` and DM the bot even if `allow_dms` is `false`.<br /><br />**Leave `allowed_ids` empty to allow ALL in that category.**<br /><br />**Role and channel permissions do not affect DMs.**<br /><br />**You can use [category](https://support.discord.com/hc/en-us/articles/115001580171-Channel-Categories-101) IDs to control channel permissions in groups.** |
+
+The rate, spam, prompt size, concurrency, and output token settings are enforced before requests are sent to the LLM. Blocked requests are recorded in the local usage log so `/monitor` can show recent guardrail pressure.
 
 ### LLM settings:
 

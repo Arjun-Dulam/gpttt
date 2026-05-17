@@ -8,6 +8,9 @@
 !*.py
 
 !Dockerfile
-!config-example.yaml
 !docker-compose.yaml
 !requirements.txt
+
+# Local config and secrets stay ignored by the whitelist above:
+# config.yaml
+# .env
