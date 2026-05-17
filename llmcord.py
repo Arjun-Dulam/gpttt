@@ -104,6 +104,7 @@ class MonitorState:
     failed_llm_requests: int = 0
     generated_messages: int = 0
     active_generations: int = 0
+    peak_active_generations: int = 0
     last_request_time: Optional[datetime] = None
     last_error: Optional[str] = None
 
@@ -243,6 +244,48 @@ def summarize_top_messengers(events: list[dict[str, Any]], limit: int = 5) -> li
     return sorted(((user_id, count, cost) for user_id, (count, cost) in users.items()), key=lambda item: (-item[1], -item[2], item[0]))[:limit]
 
 
+def summarize_top_spenders(events: list[dict[str, Any]], limit: int = 5) -> list[tuple[int, float, int]]:
+    users = {}
+
+    for event in events:
+        if not event.get("success"):
+            continue
+
+        user_id = int(event["user_id"])
+        cost, count = users.get(user_id, (0.0, 0))
+        users[user_id] = (cost + float(event.get("estimated_cost", 0)), count + 1)
+
+    return sorted(((user_id, cost, count) for user_id, (cost, count) in users.items()), key=lambda item: (-item[1], -item[2], item[0]))[:limit]
+
+
+def summarize_demand(events: list[dict[str, Any]]) -> dict[str, float]:
+    now = time.time()
+    last_5m = [event for event in events if float(event.get("timestamp", 0)) >= now - 5 * 60]
+    last_1h = [event for event in events if float(event.get("timestamp", 0)) >= now - SECONDS_PER_HOUR]
+    successful_1h = [event for event in last_1h if event.get("success")]
+
+    cost_1h = sum(float(event.get("estimated_cost", 0)) for event in last_1h)
+    tokens_1h = sum(int(event.get("input_tokens", 0)) + int(event.get("output_tokens", 0)) for event in successful_1h)
+    prompt_chars_1h = sum(int(event.get("prompt_chars", 0)) for event in successful_1h)
+    response_chars_1h = sum(int(event.get("response_chars", 0)) for event in successful_1h)
+    durations_1h = [float(event.get("duration_seconds", 0)) for event in successful_1h if event.get("duration_seconds") is not None]
+    avg_duration = sum(durations_1h) / len(durations_1h) if durations_1h else 0
+    failure_rate = (sum(1 for event in last_1h if not event.get("success")) / len(last_1h) * 100) if last_1h else 0
+
+    return dict(
+        requests_5m=len(last_5m),
+        requests_1h=len(last_1h),
+        requests_per_minute_1h=len(last_1h) / 60,
+        projected_daily_cost=cost_1h * 24,
+        avg_cost_per_request=cost_1h / len(successful_1h) if successful_1h else 0,
+        avg_tokens_per_request=tokens_1h / len(successful_1h) if successful_1h else 0,
+        avg_prompt_chars=prompt_chars_1h / len(successful_1h) if successful_1h else 0,
+        avg_response_chars=response_chars_1h / len(successful_1h) if successful_1h else 0,
+        avg_duration_seconds=avg_duration,
+        failure_rate_1h=failure_rate,
+    )
+
+
 def extract_usage(usage: Any) -> tuple[Optional[int], Optional[int], Optional[float]]:
     if usage is None:
         return None, None, None
@@ -288,6 +331,8 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
     events = load_usage_events(curr_config)
     hour_cost, day_cost, month_cost = summarize_costs(events)
     top_messengers = summarize_top_messengers(events)
+    top_spenders = summarize_top_spenders(events)
+    demand = summarize_demand(events)
     openrouter_credits = None
     openrouter_error = None
 
@@ -331,8 +376,18 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
         name="Live Load",
         value=(
             f"Active: **{monitor_state.active_generations} / {concurrency_limit or 'unlimited'}**\n"
+            f"Peak active: **{monitor_state.peak_active_generations}**\n"
             f"Cache: **{len(msg_nodes)} / {MAX_MESSAGE_NODES}**\n"
             f"Last request: **{format_timestamp(monitor_state.last_request_time)}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Demand Pressure",
+        value=(
+            f"Last 5m: **{demand['requests_5m']:.0f}** req\n"
+            f"Last 1h: **{demand['requests_1h']:.0f}** req ({demand['requests_per_minute_1h']:.2f}/min)\n"
+            f"Projected daily burn: **{format_money(demand['projected_daily_cost'])}**"
         ),
         inline=False,
     )
@@ -349,8 +404,18 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
         name="Reliability",
         value=(
             f"Success rate: **{success_rate:.1f}%**\n"
-            f"Failures: **{monitor_state.failed_llm_requests:,}**\n"
+            f"1h failure rate: **{demand['failure_rate_1h']:.1f}%**\n"
+            f"Total failures: **{monitor_state.failed_llm_requests:,}**\n"
             f"30d tokens: **{total_tokens_30d:,}**"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Request Shape, 1h",
+        value=(
+            f"Avg cost: **{format_money(demand['avg_cost_per_request'])}**\n"
+            f"Avg tokens: **{format_number(demand['avg_tokens_per_request'])}**\n"
+            f"Avg time: **{demand['avg_duration_seconds']:.1f}s**"
         ),
         inline=True,
     )
@@ -378,6 +443,12 @@ async def build_monitor_embed(curr_config: dict[str, Any]) -> discord.Embed:
         for index, (user_id, count, cost) in enumerate(top_messengers, start=1)
     )
     embed.add_field(name="Top Messengers, 30d", value=leaderboard or "No usage yet", inline=True)
+
+    spend_leaderboard = "\n".join(
+        f"**{index}.** <@{user_id}> - **{format_money(cost)}**, **{count}** req"
+        for index, (user_id, cost, count) in enumerate(top_spenders, start=1)
+    )
+    embed.add_field(name="Top Spenders, 30d", value=spend_leaderboard or "No usage yet", inline=True)
 
     if monitor_state.last_error:
         embed.add_field(name="Last Error", value=monitor_state.last_error[:1024], inline=False)
@@ -617,7 +688,9 @@ async def on_message(new_msg: discord.Message) -> None:
 
     monitor_state.llm_requests += 1
     monitor_state.active_generations += 1
+    monitor_state.peak_active_generations = max(monitor_state.peak_active_generations, monitor_state.active_generations)
     monitor_state.last_request_time = datetime.now().astimezone()
+    request_started_at = time.monotonic()
 
     try:
         async with new_msg.channel.typing():
@@ -689,6 +762,7 @@ async def on_message(new_msg: discord.Message) -> None:
     monitor_state.generated_messages += len(response_msgs)
 
     response_text = "".join(response_contents)
+    duration_seconds = time.monotonic() - request_started_at
     input_tokens, output_tokens, estimated_cost = estimate_usage_cost(config, provider_slash_model, prompt_chars, len(response_text), input_tokens, output_tokens, provider_cost)
     usage_event = dict(
         timestamp=time.time(),
@@ -702,6 +776,7 @@ async def on_message(new_msg: discord.Message) -> None:
         output_tokens=output_tokens,
         estimated_cost=estimated_cost,
         provider_cost=provider_cost,
+        duration_seconds=duration_seconds,
         success=request_succeeded,
         error=error_summary,
     )
